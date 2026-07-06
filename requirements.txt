@@ -1,0 +1,2 @@
+fastmcp>=3.0
+# Optional for PNG conversion: pip install "accform-layout-mcp[png]"

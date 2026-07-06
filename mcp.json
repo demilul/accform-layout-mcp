@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "accform-layout": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["${workspaceFolder}/server.py"],
+      "env": {
+        "ACCFORM_SRC_ROOT": "${workspaceFolder}"
+      }
+    }
+  }
+}
