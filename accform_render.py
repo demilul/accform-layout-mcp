@@ -17,12 +17,41 @@ truncated when this was written): CheckBox/OptionButton, Image, Tab, Subform,
 OptionGroup, generic placeholder, and colour resolution. Colour resolution
 handles absolute OLE colours exactly; theme-referenced colours fall back to the
 supplied default (see resolve_node_color).
+
+Properties a control does not write itself are taken from the form's default
+control styles, and a missing height of text-like controls falls back to a
+font-based estimate of the Access built-in (see ACCESS_DEFAULT_FONT_SIZE).
 """
 
 from __future__ import annotations
 
 TWIPS_PER_PX = 15.0  # px = twips * 96 / 1440 = twips / 15
-GENERATOR_VERSION = "py-port-1.0"
+GENERATOR_VERSION = "py-port-1.1"
+
+# SaveAsText omits every property that equals its default. The default comes
+# from the form's default control style (the "Begin <Type>" blocks without a
+# Name at the top of the container) and, failing that, from Access itself.
+# A control without its own Height therefore has a height - it is just not
+# written. These constants cover the Access built-ins the renderer needs.
+#
+# Access's built-in font for controls is MS Sans Serif 8 pt: a form whose
+# default styles set no FontSize uses it (modern forms write FontSize =11
+# explicitly in their default styles).
+ACCESS_DEFAULT_FONT_SIZE = 8.0
+# Controls whose built-in height follows the font. The height is approximated
+# as font size * 24 + 48 twips: 8 pt -> 240 (0.423 cm), 11 pt -> 312, close to
+# the 240/315 Access uses. Lines, rectangles, images, subforms etc. have no
+# font-based height and keep 0 if nothing is written.
+FONT_HEIGHT_TYPES = frozenset(
+    {"TextBox", "ComboBox", "Label", "ListBox", "CommandButton", "ToggleButton"}
+)
+# Section keywords in file order of appearance; forms and reports.
+SECTION_TYPES = frozenset(
+    {
+        "FormHeader", "PageHeader", "ReportHeader", "BreakHeader", "Section",
+        "BreakFooter", "PageFooter", "FormFooter", "ReportFooter",
+    }
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +215,7 @@ class SvgWriter:
         self.image_embed = image_embed
         self._lines: list[str] = []
         self._indent = 0
+        self._styles: dict[str, dict[str, str]] = {}
 
     # -- public ------------------------------------------------------------- #
     def generate(self, root: LayoutNode) -> str:
@@ -196,6 +226,7 @@ class SvgWriter:
         if form is None:
             return ""
 
+        self._styles = self._collect_default_styles(form)
         form_w = _to_float(form.prop_val("Width", 10000))
         total_h = self._calc_total_height(form)
         dbl_w = form_w / TWIPS_PER_PX
@@ -239,11 +270,31 @@ class SvgWriter:
         return sum(s.twip_height for s in sections)
 
     def _collect_sections(self, node: LayoutNode, out: list[LayoutNode]) -> None:
+        # All section kinds, in file order - the order Access stacks them in
+        # design view. Collecting only "Section" (the detail) dropped the form
+        # header with its column captions and the footer with its buttons.
         for child in node.children:
-            if child.control_type == "Section":
+            if child.control_type in SECTION_TYPES:
                 out.append(child)
             elif child.control_type == "Defaults":
                 self._collect_sections(child, out)
+
+    @staticmethod
+    def _collect_default_styles(form: LayoutNode) -> dict[str, dict[str, str]]:
+        """The form's default control styles: control type -> properties.
+
+        They live in the anonymous container next to the sections, as
+        "Begin <Type>" blocks without a Name.
+        """
+        styles: dict[str, dict[str, str]] = {}
+        for container in form.children:
+            if container.control_type != "Defaults":
+                continue
+            for child in container.children:
+                if child.control_type in SECTION_TYPES or child.has_prop("Name"):
+                    continue
+                styles.setdefault(child.control_type, {}).update(child.props)
+        return styles
 
     # -- emit --------------------------------------------------------------- #
     def _add(self, line: str) -> None:
@@ -304,11 +355,29 @@ class SvgWriter:
                 self._render_children(node, section_y)
 
     # -- geometry / colour -------------------------------------------------- #
+    def _prop(self, node: LayoutNode, key: str, default=None):
+        """A property as Access sees it: the control's own value, else the
+        form's default style for its type, else ``default``."""
+        if node.has_prop(key):
+            return node.prop_val(key)
+        return self._styles.get(node.control_type, {}).get(key, default)
+
+    def _twips(self, node: LayoutNode, key: str) -> float:
+        return _to_float(self._prop(node, key, 0), 0.0)
+
+    def _height_twips(self, node: LayoutNode) -> float:
+        h = self._twips(node, "Height")
+        if h <= 0 and node.control_type in FONT_HEIGHT_TYPES:
+            size = _to_float(self._prop(node, "FontSize", ACCESS_DEFAULT_FONT_SIZE),
+                             ACCESS_DEFAULT_FONT_SIZE)
+            h = size * 24 + 48
+        return h
+
     def _rect(self, node: LayoutNode, section_y: float):
         x = node.twip_left / TWIPS_PER_PX
         y = section_y + node.twip_top / TWIPS_PER_PX
-        w = node.twip_width / TWIPS_PER_PX
-        h = node.twip_height / TWIPS_PER_PX
+        w = self._twips(node, "Width") / TWIPS_PER_PX
+        h = self._height_twips(node) / TWIPS_PER_PX
         return x, y, w, h
 
     def _resolve_color(self, node: LayoutNode, prefix: str, default: str) -> str:
@@ -417,8 +486,8 @@ class SvgWriter:
     def _render_line(self, node, section_y):
         x1 = node.twip_left / TWIPS_PER_PX
         y1 = section_y + node.twip_top / TWIPS_PER_PX
-        x2 = x1 + node.twip_width / TWIPS_PER_PX
-        y2 = y1 + node.twip_height / TWIPS_PER_PX
+        x2 = x1 + self._twips(node, "Width") / TWIPS_PER_PX
+        y2 = y1 + self._twips(node, "Height") / TWIPS_PER_PX
         color = self._resolve_color(node, "Border", "#000000")
         width = _to_float(node.prop_val("BorderWidth", 1)) / TWIPS_PER_PX
         if width < 1:
